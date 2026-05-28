@@ -27,6 +27,10 @@ namespace asymmetric_hashing_internal {
 namespace HWY_NAMESPACE {
 namespace hn = hwy::HWY_NAMESPACE;
 
+// RVV LMUL selector. kPow2=2 selects m4; on fixed-width targets (e.g. x86)
+// kPow2 is clamped to the native vector, so this is a no-op there.
+inline constexpr int kLut16Pow2 = (HWY_TARGET == HWY_RVV) ? 1 : 0;
+
 SCANN_HIGHWAY_INLINE void ExpandToInt32AccumAndStore(
     const int16_t* HWY_RESTRICT dist16, int32_t* HWY_RESTRICT dist32) {
   const hn::ScalableTag<int16_t> d16;
@@ -153,7 +157,7 @@ SCANN_HIGHWAY_INLINE void HighwayLUT16BottomLoopAccum(
     const uint8_t* HWY_RESTRICT data_start, const uint8_t* lookup_starts,
     const DimensionIndex num_blocks, V16& int16_accums0, V16& int16_accums1,
     V16& int16_accums2, V16& int16_accums3) {
-  const hn::ScalableTag<uint8_t> d;
+  const hn::ScalableTag<uint8_t, kLut16Pow2> d;   // kPow2=2 → RVV m4
   using V = decltype(hn::Zero(d));
   const size_t N = hn::Lanes(d);
   const size_t num_blocks_per_iter = N / 16;
@@ -205,10 +209,9 @@ SCANN_HIGHWAY_INLINE void HighwayLUT16BottomLoopAccum(
 
 template <class D16>
 SCANN_HIGHWAY_INLINE void HighwayPostProcess128Bits(
-    D16 d, const DimensionIndex num_blocks, std::array<int16_t, 32>& dist16,
+    D16 d16, const DimensionIndex num_blocks, std::array<int16_t, 32>& dist16,
     hn::Vec<D16>& int16_accums0, hn::Vec<D16>& int16_accums1,
     hn::Vec<D16>& int16_accums2, hn::Vec<D16>& int16_accums3) {
-  const hn::ScalableTag<int16_t> d16;
   using V16 = decltype(hn::Zero(d16));
   V16 total_bias = Set(d16, num_blocks * 128);
   V16 v0 = int16_accums0;
@@ -232,10 +235,9 @@ SCANN_HIGHWAY_INLINE void HighwayPostProcess128Bits(
 
 template <class D16>
 SCANN_HIGHWAY_INLINE void HighwayPostProcess256Bits(
-    D16 d, const DimensionIndex num_blocks, std::array<int16_t, 32>& dist16,
+    D16 d16, const DimensionIndex num_blocks, std::array<int16_t, 32>& dist16,
     hn::Vec<D16>& int16_accums0, hn::Vec<D16>& int16_accums1,
     hn::Vec<D16>& int16_accums2, hn::Vec<D16>& int16_accums3) {
-  const hn::ScalableTag<int16_t> d16;
   using V16 = decltype(hn::Zero(d16));
 
   V16 total_bias = Set(d16, num_blocks * 128);
@@ -261,10 +263,9 @@ SCANN_HIGHWAY_INLINE void HighwayPostProcess256Bits(
 
 template <class D16>
 SCANN_HIGHWAY_INLINE void HighwayPostProcess512Bits(
-    D16 d, const DimensionIndex num_blocks, std::array<int16_t, 32>& dist16,
+    D16 d16, const DimensionIndex num_blocks, std::array<int16_t, 32>& dist16,
     hn::Vec<D16>& int16_accums0, hn::Vec<D16>& int16_accums1,
     hn::Vec<D16>& int16_accums2, hn::Vec<D16>& int16_accums3) {
-  const hn::ScalableTag<int16_t> d16;
   const hn::Half<decltype(d16)> d16_half;
   using V16 = decltype(hn::Zero(d16));
   using V8 = decltype(hn::Zero(d16_half));
@@ -308,8 +309,8 @@ SCANN_HIGHWAY_INLINE void HighwayLUT16BottomLoop(
     array<array<int16_t, 32>, kNumQueries>& dist16) {
   static_assert(kNumQueries <= 3,
                 "Register spilling happens when kNumQueries > 3");
-  const hn::ScalableTag<uint8_t> d;
-  const hn::ScalableTag<int16_t> d16;
+  const hn::ScalableTag<uint8_t, kLut16Pow2> d;
+  const hn::ScalableTag<int16_t, kLut16Pow2> d16;
   const size_t N = hn::Lanes(d);
   const size_t num_32dp_blocks = N / 16;
   using V16 = decltype(hn::Zero(d16));
