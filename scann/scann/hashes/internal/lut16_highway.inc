@@ -19,6 +19,10 @@
 #include "scann/utils/common.h"
 #include "scann/utils/intrinsics/attributes.h"
 
+#if HWY_TARGET == HWY_RVV
+#include <riscv_vector.h>
+#endif
+
 HWY_BEFORE_NAMESPACE();
 
 namespace research_scann {
@@ -134,6 +138,106 @@ SCANN_HIGHWAY_INLINE void MultiplyAddAndStoreFloat(
     hn::StoreU(hn::MulAdd(fval, mults, biases), df, result + (i * N));
   }
 }
+
+#if HWY_TARGET == HWY_RVV
+// RVV widening accumulator: SEW stays at e8 throughout the inner loop,
+// eliminating the 2 vsetvli per iter that the portable path emits.
+//
+// Layout: 2x vuint16m2_t (= 4 physical registers), same total footprint
+// as original's 4x vint16m1_t but without bit-packing trick.
+//
+// Overflow bound: each e16 lane sums bytes ∈ [0,255], so safe for
+// num_iters ≤ 257. ScaNN's typical num_blocks gives num_iters ≤ 256.
+SCANN_HIGHWAY_INLINE void HighwayLUT16BottomLoopAccumRvv(
+    const PrefetchStrategy prefetch_strategy,
+    const uint8_t* HWY_RESTRICT data_start,
+    const uint8_t* lookup_starts,
+    const DimensionIndex num_blocks,
+    vuint16m2_t& acc_wide0,
+    vuint16m2_t& acc_wide1) {
+  const size_t vl = __riscv_vsetvlmax_e8m1();
+  const size_t num_blocks_per_iter = vl / 16;
+  const size_t num_iters = num_blocks / num_blocks_per_iter;
+
+  // base_off = vid() & ~0x0F — per-16-lane block base, needed so that
+  // vrgather picks from the correct 16-byte LUT chunk per block.
+  const vuint8m1_t base_off = __riscv_vand_vx_u8m1(
+      __riscv_vid_v_u8m1(vl), 0xF0, vl);
+
+  for (size_t i = 0; i < num_iters; ++i) {
+    if (prefetch_strategy != PrefetchStrategy::kOff) {
+      absl::PrefetchToLocalCacheNta(
+          (data_start + i * vl) + kPrefetchBytesAhead);
+    }
+    vuint8m1_t dp   = __riscv_vle8_v_u8m1(data_start + i * vl, vl);
+    vuint8m1_t dp0  = __riscv_vand_vx_u8m1(dp, 0x0F, vl);
+    vuint8m1_t dp1  = __riscv_vsrl_vx_u8m1(dp, 4, vl);
+    vuint8m1_t lut  = __riscv_vle8_v_u8m1(lookup_starts + i * vl, vl);
+    vuint8m1_t idx0 = __riscv_vadd_vv_u8m1(dp0, base_off, vl);
+    vuint8m1_t idx1 = __riscv_vadd_vv_u8m1(dp1, base_off, vl);
+    vuint8m1_t res0 = __riscv_vrgather_vv_u8m1(lut, idx0, vl);
+    vuint8m1_t res1 = __riscv_vrgather_vv_u8m1(lut, idx1, vl);
+
+    // Widening accumulate: vd(e16/m2) += zext(vs1(e8/m1)). vtype stays e8/m1.
+    acc_wide0 = __riscv_vwaddu_wv_u16m2(acc_wide0, res0, vl);
+    acc_wide1 = __riscv_vwaddu_wv_u16m2(acc_wide1, res1, vl);
+  }
+
+  // Tail for residual blocks. ScaNN typical num_blocks is a multiple
+  // of num_blocks_per_iter, so this path is usually skipped.
+  const size_t rem = num_blocks % num_blocks_per_iter;
+  if (rem > 0) {
+    const size_t rem_lanes = 16 * rem;
+    vbool8_t mask = __riscv_vmsltu_vx_u8m1_b8(
+        __riscv_vid_v_u8m1(vl), rem_lanes, vl);
+    vuint8m1_t dp   = __riscv_vle8_v_u8m1_m(mask,
+                          data_start + num_iters * vl, vl);
+    vuint8m1_t dp0  = __riscv_vand_vx_u8m1(dp, 0x0F, vl);
+    vuint8m1_t dp1  = __riscv_vsrl_vx_u8m1(dp, 4, vl);
+    vuint8m1_t lut  = __riscv_vle8_v_u8m1_m(mask,
+                          lookup_starts + num_iters * vl, vl);
+    vuint8m1_t idx0 = __riscv_vadd_vv_u8m1(dp0, base_off, vl);
+    vuint8m1_t idx1 = __riscv_vadd_vv_u8m1(dp1, base_off, vl);
+    vuint8m1_t res0 = __riscv_vrgather_vv_u8m1(lut, idx0, vl);
+    vuint8m1_t res1 = __riscv_vrgather_vv_u8m1(lut, idx1, vl);
+    acc_wide0 = __riscv_vwaddu_wv_u16m2(acc_wide0, res0, vl);
+    acc_wide1 = __riscv_vwaddu_wv_u16m2(acc_wide1, res1, vl);
+  }
+}
+
+// Convert 1x vuint16m2_t accumulator into the original 2x vint16m1_t layout
+// that HighwayPostProcess128/256/512Bits consumes.
+//
+// Original layout (from Accumulate at line 134-146):
+//   accum_a[k] = sum_iters( res[2k] | (res[2k+1] << 8) )   (mod 2^16)
+//   accum_b[k] = sum_iters( res[2k+1] )
+//
+// New layout (from vwaddu.wv):
+//   acc_wide[j] = sum_iters( res[j] )       for j ∈ [0, 31]
+//
+// Reconstruction:
+//   sum_even[k] = acc_wide[2k]              ← via vnsrl_wx shift=0
+//   sum_odd[k]  = acc_wide[2k+1]            ← via vnsrl_wx shift=16
+//   accum_a[k]  = sum_even[k] + (sum_odd[k] << 8)
+//   accum_b[k]  = sum_odd[k]
+template <class V16>
+SCANN_HIGHWAY_INLINE void RvvUnpackToM1Layout(
+    vuint16m2_t acc_wide, V16& accum_a, V16& accum_b) {
+  const size_t vl16_m1 = __riscv_vsetvlmax_e16m1();
+  // Reinterpret 32 e16 lanes as 16 e32 lanes (no instruction emitted).
+  vuint32m2_t aw_as32 = __riscv_vreinterpret_v_u16m2_u32m2(acc_wide);
+  // Narrow back to e16: low half of each e32 lane = even-position byte sum.
+  vuint16m1_t sum_even = __riscv_vnsrl_wx_u16m1(aw_as32, 0,  vl16_m1);
+  vuint16m1_t sum_odd  = __riscv_vnsrl_wx_u16m1(aw_as32, 16, vl16_m1);
+  vuint16m1_t a_unsigned = __riscv_vadd_vv_u16m1(
+      sum_even,
+      __riscv_vsll_vx_u16m1(sum_odd, 8, vl16_m1),
+      vl16_m1);
+  // V16 = vint16m1_t in Highway; reinterpret from unsigned.
+  accum_a = __riscv_vreinterpret_v_u16m1_i16m1(a_unsigned);
+  accum_b = __riscv_vreinterpret_v_u16m1_i16m1(sum_odd);
+}
+#endif  // HWY_TARGET == HWY_RVV
 
 template <class D, class D16 = hn::Repartition<int16_t, D>>
 SCANN_HIGHWAY_INLINE void Accumulate(const D d, hn::Vec<D> res,
@@ -327,17 +431,58 @@ SCANN_HIGHWAY_INLINE void HighwayLUT16BottomLoop(
   V16 int16_accums10 = int16_accums0;
   V16 int16_accums11 = int16_accums0;
 
+#if HWY_TARGET == HWY_RVV
+  {
+    const size_t vl_init = __riscv_vsetvlmax_e8m1();
+    vuint16m2_t acc_w0 = __riscv_vmv_v_x_u16m2(0, vl_init);
+    vuint16m2_t acc_w1 = __riscv_vmv_v_x_u16m2(0, vl_init);
+    HighwayLUT16BottomLoopAccumRvv(kPrefetch, data_start,
+                                   lookup_starts[0], num_blocks,
+                                   acc_w0, acc_w1);
+    RvvUnpackToM1Layout(acc_w0, int16_accums0, int16_accums1);
+    RvvUnpackToM1Layout(acc_w1, int16_accums2, int16_accums3);
+  }
+#else
   HighwayLUT16BottomLoopAccum<kPrefetch>(
       data_start, lookup_starts[0], num_blocks, int16_accums0, int16_accums1,
       int16_accums2, int16_accums3);
-  if constexpr (kNumQueries > 1)
+#endif
+  if constexpr (kNumQueries > 1) {
+#if HWY_TARGET == HWY_RVV
+    {
+      const size_t vl_init = __riscv_vsetvlmax_e8m1();
+      vuint16m2_t acc_w0 = __riscv_vmv_v_x_u16m2(0, vl_init);
+      vuint16m2_t acc_w1 = __riscv_vmv_v_x_u16m2(0, vl_init);
+      HighwayLUT16BottomLoopAccumRvv(kPrefetch, data_start,
+                                     lookup_starts[1], num_blocks,
+                                     acc_w0, acc_w1);
+      RvvUnpackToM1Layout(acc_w0, int16_accums4, int16_accums5);
+      RvvUnpackToM1Layout(acc_w1, int16_accums6, int16_accums7);
+    }
+#else
     HighwayLUT16BottomLoopAccum<kPrefetch>(
         data_start, lookup_starts[1], num_blocks, int16_accums4, int16_accums5,
         int16_accums6, int16_accums7);
-  if constexpr (kNumQueries > 2)
+#endif
+  }
+  if constexpr (kNumQueries > 2) {
+#if HWY_TARGET == HWY_RVV
+    {
+      const size_t vl_init = __riscv_vsetvlmax_e8m1();
+      vuint16m2_t acc_w0 = __riscv_vmv_v_x_u16m2(0, vl_init);
+      vuint16m2_t acc_w1 = __riscv_vmv_v_x_u16m2(0, vl_init);
+      HighwayLUT16BottomLoopAccumRvv(kPrefetch, data_start,
+                                     lookup_starts[2], num_blocks,
+                                     acc_w0, acc_w1);
+      RvvUnpackToM1Layout(acc_w0, int16_accums8, int16_accums9);
+      RvvUnpackToM1Layout(acc_w1, int16_accums10, int16_accums11);
+    }
+#else
     HighwayLUT16BottomLoopAccum<kPrefetch>(
         data_start, lookup_starts[2], num_blocks, int16_accums8, int16_accums9,
         int16_accums10, int16_accums11);
+#endif
+  }
 
   if (num_32dp_blocks == 1) {
     HighwayPostProcess128Bits(d16, num_blocks, dist16[0], int16_accums0,
